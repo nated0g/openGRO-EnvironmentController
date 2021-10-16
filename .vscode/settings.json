@@ -1,0 +1,7 @@
+{
+    "cmake.configureOnOpen": false,
+    "files.associations": {
+        "hash_map.h": "c",
+        "hash_functions.h": "c"
+    }
+}
