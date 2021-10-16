@@ -10,5 +10,6 @@ extern char keys[NUM_CONFIG_ITEMS][MAX_KEY_LENGTH];
 esp_err_t nvs_init(nvs_handle_t handle);
 
 void init_config(void);
+void print_config(void);
 esp_err_t set_config(char *key, int32_t value);
 

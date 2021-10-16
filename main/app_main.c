@@ -38,7 +38,9 @@
 #include "esp_log.h"
 #include "mqtt_client.h"
 
+#include "driver/gpio.h"
 #include "room_config.h"
+#include "app_main.h"
 
 static const char *TAG = "og-room-controller";
 
@@ -122,6 +124,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        mqtt_sub_config_topics();
         MQTT_OK = ESP_OK;
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -158,6 +161,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 esp_err_t mqtt_sub_config_topics(void)
 {
     // Wow this is all very unneccessary, just use a wildcard
+    /*
     char *prefix = "devices/";
     char topic_prefix[strlen(prefix) + strlen(TEMP_DEVICE_ID) + 2];
     strcpy(topic_prefix, prefix);
@@ -171,14 +175,16 @@ esp_err_t mqtt_sub_config_topics(void)
 
         esp_mqtt_client_subscribe(mqtt_client, topic, 0);
     }
+    */
+    esp_mqtt_client_subscribe(mqtt_client, "devices/1234567890ab/#", 0);
     return ESP_OK;
 }
 
 esp_err_t mqtt_message_receive(void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
-    char topic[event->topic_len];
-    strcpy(topic, event->topic);
+    char topic[event->topic_len + 1];
+    sprintf(topic, "%.*s", event->topic_len, event->topic);
     //"devices/xxxxxxxxxxxxxx/settings/ac_g_mode/set"
     char *rest = NULL;
     char *token;
@@ -193,10 +199,11 @@ esp_err_t mqtt_message_receive(void *event_data)
         // level for which config item to update
         if (!strcmp(token, "set"))
         {
-            strtol(event->data, NULL, val);
+            char data[event->data_len + 1];
+            sprintf(data, "%.*s", event->data_len, event->data);
+            val = strtol(data, NULL, 10);
             set_config(last, val);
         }
-        printf("token:%s\n", token);
         strcpy(last, token);
     }
     return ESP_OK;
@@ -248,32 +255,24 @@ void set_esp_log_levels(void)
     esp_log_level_set("TRANSPORT", ESP_LOG_VERBOSE);
     esp_log_level_set("OUTBOX", ESP_LOG_VERBOSE);
 }
-void test_task(void)
-{
-    while (1)
-    {
-        init_config();
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
-    }
-}
 
-void inc_task(void)
+void print_config_task(void)
 {
     while (1)
     {
         vTaskDelay(10000 / portTICK_PERIOD_MS);
-        set_config("ac_y_mode", 5);
-        printf("Attempting set_config \n \n");
+        print_config();
     }
 }
+
 void app_main(void)
 {
 
-    xTaskCreatePinnedToCore(test_task, "test_task", 1024 * 16, NULL, 5, NULL, APP_CPU_NUM);
-    xTaskCreatePinnedToCore(inc_task, "inc_task", 1024 * 16, NULL, 5, NULL, APP_CPU_NUM);
+    xTaskCreatePinnedToCore(print_config_task, "print_config_task", 1024 * 16, NULL, 5, NULL, APP_CPU_NUM);
+
     set_esp_log_levels();
     fflush(stdout);
-    
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -301,12 +300,13 @@ void app_main(void)
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_handle = NULL;
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
-    // attach Ethernet driver to TCP/IP stack 
+    // attach Ethernet driver to TCP/IP stack
     ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
-    // start Ethernet driver state machine 
+    // start Ethernet driver state machine
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
     //ESP_ERROR_CHECK(i2cdev_init());
     mqtt_app_start();
+    init_config();
     //xTaskCreatePinnedToCore(task_mqtt_report, "mqtt_report", 1024 * 36, NULL, 5, NULL, APP_CPU_NUM);
 }

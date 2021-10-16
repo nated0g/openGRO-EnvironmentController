@@ -29,9 +29,7 @@ char keys[NUM_CONFIG_ITEMS][MAX_KEY_LENGTH] = {
     "l_on_time_ts",
     "l_off_time_ts",
     "sr_len_s",
-    "ss_len_s"
-};
-
+    "ss_len_s"};
 
 typedef struct
 {
@@ -87,10 +85,14 @@ void init_config(void)
         printf("Committing config values to NVS.\n");
         nvs_commit(handle);
         nvs_close(handle);
-        for (int i = 0; i < NUM_CONFIG_ITEMS; i++)
-        {
-            printf("%s is %d\n", config[i].key, config[i].value);
-        }
+    }
+}
+
+void print_config(void)
+{
+    for (int i = 0; i < NUM_CONFIG_ITEMS; i++)
+    {
+        printf("%s is %d\n", config[i].key, config[i].value);
     }
 }
 
@@ -102,12 +104,13 @@ esp_err_t set_config(char *key, int32_t value)
         if (!strcmp(key, config[i].key))
         {
             config[i].value = value;
-            
+
             nvs_handle_t handle;
             esp_err_t err;
 
             // Open
             err = nvs_open("config", NVS_READWRITE, &handle);
+            printf("%s:%d\n", config[i].key, config[i].value);
             if (err != ESP_OK)
                 return err;
             nvs_set_i32(handle, key, value);
