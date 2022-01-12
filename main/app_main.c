@@ -38,16 +38,113 @@
 #include "esp_log.h"
 #include "mqtt_client.h"
 
+#include "mcp23x17.h"
+
 #include "driver/gpio.h"
 #include "room_config.h"
 #include "app_main.h"
 
 static const char *TAG = "og-room-controller";
 
-static xQueueHandle scd30_data_queue;
 esp_mqtt_client_handle_t mqtt_client;
 
 esp_err_t MQTT_OK = ESP_FAIL;
+
+// Master state variable that gets mapped to the mcp23017 outputs
+// successive stages of masks for various control layers
+// ie, hand/off/auto, call, timer, etc.
+
+// use a struct to store the state of each function?
+
+
+
+/*
+
+How can we confirm with absolute certainty that we have reasonable data?
+
+I think the checks have to happen on multiple levels.  First, the sensor needs to do some low level checks,
+ie, we need to know whether the i2c bus is throwing an error.  We need to somehow bubble this up to the next layer.
+Easiest would be some sort of handshake.  Sensor sets a flag high as long as i2c bus is ok and data makes sense.
+
+SN = SensorNode
+RC = RoomController
+
+
+
+*/
+
+#define configSUPPORT_DYNAMIC_ALLOCATION 1
+
+int32_t ctod;
+
+SemaphoreHandle_t xSemaphoreOutputStatesReady = NULL;
+
+void task_eval_outputs(void *pvParameters)
+{
+    if (xSemaphoreOutputStatesReady != NULL)
+    {
+        while (1)
+        {
+            for (int i = 0; i < NUM_OUTPUTS; i++)
+            {
+                int32_t mode = outputs[i].mode;
+                switch (mode)
+                {
+                case OFF_MODE:
+                    outputs[i].state = OFF;
+                    break;
+                case MANUAL_MODE:
+                    outputs[i].state = ON;
+                    break;
+                case AUTO_MODE:
+                    // evaluate all control mechanisms
+                    if (outputs[i].hyst.enabled)
+                    {
+                        update_hyst_state(&outputs[i].hyst);
+                        outputs[i].state = outputs[i].hyst.state;
+                    }
+                    if (outputs[i].sched.enabled)
+                    {
+                        update_sched_state(&outputs[i].sched);
+                        outputs[i].state = outputs[i].sched.state;
+                    }
+                    if (outputs[i].hyst.enabled && outputs[i].sched.enabled)
+                        outputs[i].state = outputs[i].hyst.state && outputs[i].sched.state;
+                }
+            }
+            xSemaphoreGive(xSemaphoreOutputStatesReady);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+}
+
+void task_write_outputs(void *pvParameters)
+{
+    mcp23x17_t dev;
+    memset(&dev, 0, sizeof(mcp23x17_t));
+    // initialize the GPIO expander
+    ESP_ERROR_CHECK(mcp23x17_init_desc(&dev, 0, MCP23X17_ADDR_BASE, SDA_GPIO, SCL_GPIO));
+    dev.cfg.master.clk_speed = 100000; // Hz
+    mcp23x17_port_set_mode(&dev, 0); // Set all pins to output
+    while (1)
+    {
+        // Block until all outputs have been evaluated
+        if (xSemaphoreTake(xSemaphoreOutputStatesReady, portMAX_DELAY) == pdTRUE)
+        {
+            uint16_t output_map = 0;
+            // shift states we calculated in task_eval_outputs into output map
+            for (int i = 0; i < NUM_OUTPUTS; i++)
+            {
+                if (outputs[i].state)
+                    output_map |= outputs[i].state << i;
+            }
+            // write outputs to GPIO expander and release the semaphore
+            if (mcp23x17_port_write(&dev, output_map) == ESP_OK)
+                xSemaphoreGive(xSemaphoreOutputStatesReady);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
 
 esp_err_t mqtt_message_receive(void *event_data);
 
@@ -124,7 +221,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-        mqtt_sub_config_topics();
+        esp_mqtt_client_subscribe(mqtt_client, "devices/1234567890ab/#", 0);
+        esp_mqtt_client_subscribe(mqtt_client, "devices/000000000001/temperature", 0);
+        esp_mqtt_client_subscribe(mqtt_client, "devices/000000000001/humidity", 0);
+        esp_mqtt_client_subscribe(mqtt_client, "devices/000000000001/co2", 0);
         MQTT_OK = ESP_OK;
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -158,30 +258,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-esp_err_t mqtt_sub_config_topics(void)
-{
-    // Wow this is all very unneccessary, just use a wildcard
-    /*
-    char *prefix = "devices/";
-    char topic_prefix[strlen(prefix) + strlen(TEMP_DEVICE_ID) + 2];
-    strcpy(topic_prefix, prefix);
-    strcat(topic_prefix, TEMP_DEVICE_ID);
-    for (int i = 0; i < NUM_CONFIG_ITEMS; i++)
-    {
-        char topic[strlen(topic_prefix) + MAX_KEY_LENGTH];
-        sprintf(topic, "%s/%s", topic_prefix, keys[i]);
-
-        printf("Subscribing to %s\n", topic);
-
-        esp_mqtt_client_subscribe(mqtt_client, topic, 0);
-    }
-    */
-    esp_mqtt_client_subscribe(mqtt_client, "devices/1234567890ab/#", 0);
-    return ESP_OK;
-}
-
 esp_err_t mqtt_message_receive(void *event_data)
 {
+    // This needs to be rewritten to seperate the logic
+    // for receiving messages from the logic for
+    // updating config items.  Need seperate functons for
+    // decoding the messages and handling them based on certain types of data
+
     esp_mqtt_event_handle_t event = event_data;
     char topic[event->topic_len + 1];
     sprintf(topic, "%.*s", event->topic_len, event->topic);
@@ -205,6 +288,19 @@ esp_err_t mqtt_message_receive(void *event_data)
             set_config(last, val);
         }
         strcpy(last, token);
+        if (!strcmp(last, "temperature"))
+        {
+            char data[event->data_len + 1];
+            sprintf(data, "%.*s", event->data_len, event->data);
+            temperature = strtol(data, NULL, 10);
+        }
+        else if (!strcmp(last, "humidity"))
+        {
+            char data[event->data_len + 1];
+            sprintf(data, "%.*s", event->data_len, event->data);
+            humidity = strtol(data, NULL, 10);
+            printf("Got humidity: %d", humidity);
+        }
     }
     return ESP_OK;
 }
@@ -260,16 +356,18 @@ void print_config_task(void)
 {
     while (1)
     {
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
-        print_config();
+        printf("DH Hysteresis State: %d\n", outputs[6].hyst.state);
+        printf("Output State: %d\n", outputs[6].state);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        //print_config();
     }
 }
 
 void app_main(void)
 {
 
-    xTaskCreatePinnedToCore(print_config_task, "print_config_task", 1024 * 16, NULL, 5, NULL, APP_CPU_NUM);
-
+    //xTaskCreatePinnedToCore(&print_config_task, "print_config_task", 1024 * 16, NULL, 5, NULL, APP_CPU_NUM);
+    xTaskCreatePinnedToCore(&print_config_task, "print_config_task", 1024 * 16, NULL, 5, NULL, APP_CPU_NUM);
     set_esp_log_levels();
     fflush(stdout);
 
@@ -305,8 +403,14 @@ void app_main(void)
     // start Ethernet driver state machine
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
-    //ESP_ERROR_CHECK(i2cdev_init());
+    // ESP_ERROR_CHECK(i2cdev_init());
     mqtt_app_start();
     init_config();
-    //xTaskCreatePinnedToCore(task_mqtt_report, "mqtt_report", 1024 * 36, NULL, 5, NULL, APP_CPU_NUM);
+    ESP_ERROR_CHECK(i2cdev_init());
+
+    xSemaphoreOutputStatesReady = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(&task_eval_outputs, "eval_output", 1024 * 16, NULL, 5, NULL, APP_CPU_NUM);
+    xTaskCreatePinnedToCore(&task_write_outputs, "write_outputs", 1024 * 16, NULL, 5, NULL, APP_CPU_NUM);
+
+    // xTaskCreatePinnedToCore(task_mqtt_report, "mqtt_report", 1024 * 36, NULL, 5, NULL, APP_CPU_NUM);
 }
